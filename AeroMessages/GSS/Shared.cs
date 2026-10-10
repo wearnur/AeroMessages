@@ -595,14 +595,48 @@ namespace AeroMessages.GSS
         public byte DamageType;
     }
 
-    // Shared between vehicle and character
+    // Shared between vehicle and character. Each field is a mask: position, rotation and aim carry a 2 bit mode
+    // (0 = full value, 1 and 2 = compact, 3 = scale/unchanged, see CurrentPoseUpdateData)
     public enum CurrentPoseUpdateFlags : byte
     {
-        ShortTime = 0x00,
-        MovementState = 0x02,
+        ShortTime = 0x01, // set: the time is one byte, the ms since the previous pose (0x00 would never match)
+        MovementState = 0x02, // set: the movement state is unchanged and not sent
         Position = 0x0c,
         Rotation = 0x30,
         Aim = 0xc0,
+    }
+
+    /// <summary>
+    /// The 24 bit vectors of compact poses (the 1962 client's decoder at +0x898180). Little endian bits 0-2: which
+    /// output axis gets which component (1-6, 0 is the zero vector); bits 3-5: exponent e; bits 6-13, 14-19 and 20-23:
+    /// a, b and c. The largest component is 2^(e+1) * scale / 127 * (2a/255 - 1), the second that times (2b/63 - 1),
+    /// the third the second times (2c/15 - 1).
+    /// </summary>
+    public static class PoseVec24
+    {
+        // Scales by mode - 1: a compact position is a VELOCITY (the client adds velocity * dt to the previous
+        // position), a compact aim a DELTA added to the previous aim, which is then renormalised
+        public static readonly float[] PositionScales = [10f, 25f, 60f];
+        public static readonly float[] AimScales = [0.2f, 0.5f];
+
+        // The output axis of each sorted component, by bits 0-2 minus one (the client's jump table at +0x89832c)
+        private static readonly int[][] Axes = [[0, 1, 2], [1, 0, 2], [1, 2, 0], [2, 1, 0], [0, 2, 1], [2, 0, 1]];
+
+        public static Vector3 Decode(byte[] bytes, float scale)
+        {
+            uint v = (uint)(bytes[0] | (bytes[1] << 8) | (bytes[2] << 16));
+            var axes = (v & 7) is >= 1 and <= 6 ? Axes[(v & 7) - 1] : null;
+            if (v == 0 || axes == null)
+            {
+                return Vector3.Zero;
+            }
+
+            float c0 = (1 << (int)(((v >> 3) & 7) + 1)) * scale / 127f * ((((v >> 6) & 0xFF) * 2f / 255f) - 1f);
+            float c1 = c0 * ((((v >> 14) & 0x3F) * 2f / 63f) - 1f);
+            float c2 = c1 * ((((v >> 20) & 0xF) * 2f / 15f) - 1f);
+            Span<float> c = [c0, c1, c2];
+            return new Vector3(c[axes[0]], c[axes[1]], c[axes[2]]);
+        }
     }
 
     [AeroBlock]
@@ -612,6 +646,21 @@ namespace AeroMessages.GSS
 
         public byte CalcFlagValue1 => ((byte)(Flags & CurrentPoseUpdateFlags.Rotation));
         public byte CalcFlagValue2 => ((byte)(Flags & CurrentPoseUpdateFlags.Aim));
+
+        /// <summary>0: full Vector3 Position; 1-3: PositionAlt is a velocity (<see cref="PositionVelocity"/>).</summary>
+        public int PositionMode => ((byte)Flags >> 2) & 3;
+
+        /// <summary>0: four 16 bit components; 1: one byte, 2: three bytes (deltas on the previous orientation, not decoded); 3: unchanged.</summary>
+        public int RotationMode => ((byte)Flags >> 4) & 3;
+
+        /// <summary>0: a full Aim direction; 1 and 2: AimAlt is a delta (<see cref="AimDelta"/>); 3: unchanged.</summary>
+        public int AimMode => ((byte)Flags >> 6) & 3;
+
+        /// <summary>The velocity in m/s of a compact position; the client moves the previous position by it times the time since.</summary>
+        public Vector3? PositionVelocity => PositionMode != 0 && PositionAlt != null ? PoseVec24.Decode(PositionAlt, PoseVec24.PositionScales[PositionMode - 1]) : null;
+
+        /// <summary>What a compact aim adds to the previous aim before renormalising.</summary>
+        public Vector3? AimDelta => AimMode is 1 or 2 && AimAlt != null ? PoseVec24.Decode(AimAlt, PoseVec24.AimScales[AimMode - 1]) : null;
 
         // ShortTime
         [AeroIf(nameof(Flags), Ops.DoesntHaveFlag, CurrentPoseUpdateFlags.ShortTime)]
