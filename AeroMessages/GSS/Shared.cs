@@ -639,6 +639,50 @@ namespace AeroMessages.GSS
         }
     }
 
+    /// <summary>
+    /// The compact orientations of poses (the 1962 client's decoders at base + 0x897df0 and 0x897c70): deltas on the
+    /// previous orientation, from sign-magnitude bytes (bit 7 the sign, the low 7 bits / 127). Mode 1 moves w by
+    /// 0.4 * the byte and rescales the xyz direction to match; mode 2 moves x, y and z by 0.5 * each of three bytes and
+    /// rebuilds w as the positive root (or normalises xyz when they are already past unit length). Verified on character
+    /// poses of the 2016 capture (applied to a full orientation they predict the next full one to 1.3 degrees median,
+    /// against 22 degrees for no change); a vehicle's compact rotations do NOT follow this, they predict worse than none.
+    /// </summary>
+    public static class PoseRotation
+    {
+        private static float SignMagnitude(byte b) => (((b & 0x80) != 0) ? -1f : 1f) * (b & 0x7F) / 127f;
+
+        /// <summary>Mode 1: one byte.</summary>
+        public static Quaternion ApplyOneByte(Quaternion previous, byte b)
+        {
+            float w = (SignMagnitude(b) * 0.4f) + previous.W;
+            float rest = 1f - (w * w);
+            if (rest <= 1e-6f)
+            {
+                return new Quaternion(0f, 0f, 0f, MathF.CopySign(1f, w));
+            }
+
+            var xyz = new Vector3(previous.X, previous.Y, previous.Z);
+            float length = xyz.Length();
+            xyz = length < 1e-6f ? Vector3.UnitZ : xyz / length; // the client falls back to z when there is no direction
+            xyz *= MathF.Sqrt(rest);
+            return new Quaternion(xyz.X, xyz.Y, xyz.Z, w);
+        }
+
+        /// <summary>Mode 2: three bytes.</summary>
+        public static Quaternion ApplyThreeBytes(Quaternion previous, byte bx, byte by, byte bz)
+        {
+            var xyz = new Vector3(previous.X + (SignMagnitude(bx) * 0.5f), previous.Y + (SignMagnitude(by) * 0.5f), previous.Z + (SignMagnitude(bz) * 0.5f));
+            float lengthSquared = xyz.LengthSquared();
+            if (lengthSquared < 1f)
+            {
+                return new Quaternion(xyz.X, xyz.Y, xyz.Z, MathF.Sqrt(1f - lengthSquared));
+            }
+
+            xyz /= MathF.Sqrt(lengthSquared);
+            return new Quaternion(xyz.X, xyz.Y, xyz.Z, 0f);
+        }
+    }
+
     [AeroBlock]
     public struct CurrentPoseUpdateData
     {
@@ -658,6 +702,18 @@ namespace AeroMessages.GSS
 
         /// <summary>The velocity in m/s of a compact position; the client moves the previous position by it times the time since.</summary>
         public Vector3? PositionVelocity => PositionMode != 0 && PositionAlt != null ? PoseVec24.Decode(PositionAlt, PoseVec24.PositionScales[PositionMode - 1]) : null;
+
+        /// <summary>
+        /// The orientation this pose gives, <paramref name="previous"/> being the orientation before it: the full one
+        /// (mode 0), a compact delta on the previous (1 and 2, see <see cref="PoseRotation"/>) or the previous (3).
+        /// </summary>
+        public Quaternion ApplyRotation(Quaternion previous) => RotationMode switch
+        {
+            0 => Rotation,
+            1 => PoseRotation.ApplyOneByte(previous, RotAltLastByte_1),
+            2 when RotAltBytes != null => PoseRotation.ApplyThreeBytes(previous, (byte)RotAltBytes[0], (byte)RotAltBytes[1], RotAltLastByte_2),
+            _ => previous,
+        };
 
         /// <summary>What a compact aim adds to the previous aim before renormalising.</summary>
         public Vector3? AimDelta => AimMode is 1 or 2 && AimAlt != null ? PoseVec24.Decode(AimAlt, PoseVec24.AimScales[AimMode - 1]) : null;
