@@ -595,6 +595,13 @@ namespace AeroMessages.GSS
         public byte DamageType;
     }
 
+    /// <summary>Which client path reads a pose: vehicles have their own scales for compact positions and rotations.</summary>
+    public enum PoseSource : byte
+    {
+        Character = 0,
+        Vehicle = 1,
+    }
+
     // Shared between vehicle and character. Each field is a mask: position, rotation and aim carry a 2 bit mode
     // (0 = full value, 1 and 2 = compact, 3 = scale/unchanged, see CurrentPoseUpdateData)
     public enum CurrentPoseUpdateFlags : byte
@@ -617,6 +624,7 @@ namespace AeroMessages.GSS
         // Scales by mode - 1: a compact position is a VELOCITY (the client adds velocity * dt to the previous
         // position), a compact aim a DELTA added to the previous aim, which is then renormalised
         public static readonly float[] PositionScales = [10f, 25f, 60f];
+        public static readonly float[] VehiclePositionScales = [20f, 30f, 100f]; // the vehicle path has its own table
         public static readonly float[] AimScales = [0.2f, 0.5f];
 
         // The output axis of each sorted component, by bits 0-2 minus one (the client's jump table at +0x89832c)
@@ -643,18 +651,21 @@ namespace AeroMessages.GSS
     /// The compact orientations of poses (the 1962 client's decoders at base + 0x897df0 and 0x897c70): deltas on the
     /// previous orientation, from sign-magnitude bytes (bit 7 the sign, the low 7 bits / 127). Mode 1 moves w by
     /// 0.4 * the byte and rescales the xyz direction to match; mode 2 moves x, y and z by 0.5 * each of three bytes and
-    /// rebuilds w as the positive root (or normalises xyz when they are already past unit length). Verified on character
-    /// poses of the 2016 capture (applied to a full orientation they predict the next full one to 1.3 degrees median,
-    /// against 22 degrees for no change); a vehicle's compact rotations do NOT follow this, they predict worse than none.
+    /// rebuilds w as the positive root (or normalises xyz when they are already past unit length). Vehicles run the same
+    /// decoders with 0.05 for both modes. Verified on the 2016 capture: applied to a full orientation they predict the next
+    /// full one to 1.3 degrees median for characters (22 for no change) and 1.6 for vehicles (4.7).
     /// </summary>
     public static class PoseRotation
     {
+        public const float OneByteScale = 0.4f;
+        public const float ThreeByteScale = 0.5f;
+        public const float VehicleScale = 0.05f; // vehicles use it for both modes
         private static float SignMagnitude(byte b) => (((b & 0x80) != 0) ? -1f : 1f) * (b & 0x7F) / 127f;
 
         /// <summary>Mode 1: one byte.</summary>
-        public static Quaternion ApplyOneByte(Quaternion previous, byte b)
+        public static Quaternion ApplyOneByte(Quaternion previous, byte b, float scale = OneByteScale)
         {
-            float w = (SignMagnitude(b) * 0.4f) + previous.W;
+            float w = (SignMagnitude(b) * scale) + previous.W;
             float rest = 1f - (w * w);
             if (rest <= 1e-6f)
             {
@@ -669,9 +680,9 @@ namespace AeroMessages.GSS
         }
 
         /// <summary>Mode 2: three bytes.</summary>
-        public static Quaternion ApplyThreeBytes(Quaternion previous, byte bx, byte by, byte bz)
+        public static Quaternion ApplyThreeBytes(Quaternion previous, byte bx, byte by, byte bz, float scale = ThreeByteScale)
         {
-            var xyz = new Vector3(previous.X + (SignMagnitude(bx) * 0.5f), previous.Y + (SignMagnitude(by) * 0.5f), previous.Z + (SignMagnitude(bz) * 0.5f));
+            var xyz = new Vector3(previous.X + (SignMagnitude(bx) * scale), previous.Y + (SignMagnitude(by) * scale), previous.Z + (SignMagnitude(bz) * scale));
             float lengthSquared = xyz.LengthSquared();
             if (lengthSquared < 1f)
             {
@@ -700,20 +711,32 @@ namespace AeroMessages.GSS
         /// <summary>0: a full Aim direction; 1 and 2: AimAlt is a delta (<see cref="AimDelta"/>); 3: unchanged.</summary>
         public int AimMode => ((byte)Flags >> 6) & 3;
 
-        /// <summary>The velocity in m/s of a compact position; the client moves the previous position by it times the time since.</summary>
-        public Vector3? PositionVelocity => PositionMode != 0 && PositionAlt != null ? PoseVec24.Decode(PositionAlt, PoseVec24.PositionScales[PositionMode - 1]) : null;
+        /// <summary>
+        /// The velocity in m/s of a compact position (null for a full one); the client moves the previous position by it
+        /// times the milliseconds since the previous pose / 1000. Vehicles use larger scales (20, 30 and 100 against 10, 25
+        /// and 60). Verified on the 2016 capture: integrated from one full position the velocities land within 0.14 m
+        /// (median) of the next full one for characters and 1.4 m for vehicles.
+        /// </summary>
+        public Vector3? PositionVelocity(PoseSource source = PoseSource.Character) =>
+            PositionMode != 0 && PositionAlt != null
+                ? PoseVec24.Decode(PositionAlt, (source == PoseSource.Vehicle ? PoseVec24.VehiclePositionScales : PoseVec24.PositionScales)[PositionMode - 1])
+                : null;
 
         /// <summary>
         /// The orientation this pose gives, <paramref name="previous"/> being the orientation before it: the full one
         /// (mode 0), a compact delta on the previous (1 and 2, see <see cref="PoseRotation"/>) or the previous (3).
         /// </summary>
-        public Quaternion ApplyRotation(Quaternion previous) => RotationMode switch
+        public Quaternion ApplyRotation(Quaternion previous, PoseSource source = PoseSource.Character)
         {
-            0 => Rotation,
-            1 => PoseRotation.ApplyOneByte(previous, RotAltLastByte_1),
-            2 when RotAltBytes != null => PoseRotation.ApplyThreeBytes(previous, (byte)RotAltBytes[0], (byte)RotAltBytes[1], RotAltLastByte_2),
-            _ => previous,
-        };
+            bool vehicle = source == PoseSource.Vehicle;
+            return RotationMode switch
+            {
+                0 => Rotation,
+                1 => PoseRotation.ApplyOneByte(previous, RotAltLastByte_1, vehicle ? PoseRotation.VehicleScale : PoseRotation.OneByteScale),
+                2 when RotAltBytes != null => PoseRotation.ApplyThreeBytes(previous, (byte)RotAltBytes[0], (byte)RotAltBytes[1], RotAltLastByte_2, vehicle ? PoseRotation.VehicleScale : PoseRotation.ThreeByteScale),
+                _ => previous,
+            };
+        }
 
         /// <summary>What a compact aim adds to the previous aim before renormalising.</summary>
         public Vector3? AimDelta => AimMode is 1 or 2 && AimAlt != null ? PoseVec24.Decode(AimAlt, PoseVec24.AimScales[AimMode - 1]) : null;
