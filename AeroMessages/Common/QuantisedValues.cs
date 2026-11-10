@@ -4,6 +4,10 @@ using Aero.Gen.Attributes;
 
 namespace AeroMessages.Common
 {
+    /// <summary>
+    /// A float in [-1, 1] as sign and magnitude: bit 15 the sign, the low 15 bits the magnitude * 32767 (the 1962
+    /// client's reader; poses' full orientations and aims).
+    /// </summary>
     [AeroBlock]
     public struct QuantisedFloat
     {
@@ -11,30 +15,19 @@ namespace AeroMessages.Common
 
         public static implicit operator float(QuantisedFloat d)
         {
-            var result = (1.0f / 32767f) * d.Value;
-            if (result >= 0) {
-                result = (result -1f) * -1f;
-            }
-
-            return result;
+            float magnitude = (d.Value & 0x7FFF) / 32767f;
+            return (d.Value & 0x8000) != 0 ? -magnitude : magnitude;
         }
 
         public static implicit operator QuantisedFloat(float d)
         {
-            const float factor = 1.0f / 32767.0f;
-
-            if (Math.Sign(d) < 0)
-            {
-                d = (d / -1.0f) + 1.0f;
-            }
-
-            ushort result = (ushort)Math.Ceiling(d / factor);
-            return new QuantisedFloat { Value = result};
+            ushort magnitude = (ushort)Math.Min(32767.0, Math.Ceiling(Math.Abs(d) * 32767.0));
+            return new QuantisedFloat { Value = (ushort)(d < 0 ? magnitude | 0x8000 : magnitude) };
         }
 
         public override string ToString() => $"{(float)this}";
     }
-    
+
     [AeroBlock]
     public struct QuantisedVector2
     {
